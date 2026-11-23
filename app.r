@@ -6,13 +6,15 @@ library(PerformanceAnalytics)
 library(httr)      
 library(jsonlite)  
 library(dotenv)    
-library(future)    
+library(future)
 library(promises)
-library(future.apply)
 library(readr)
 
-# Setup Async Plan for Parallel Processing
-plan(multisession)
+# Setup Async Plan for Parallel Processing.
+# A flat (non-nested) pool: the market scan splits the universe into one chunk
+# per worker and runs each chunk as its own future, so the work really is parallel.
+n_workers <- max(1, min(8, parallelly::availableCores() - 1))
+plan(multisession, workers = n_workers)
 
 # Load API Key
 tryCatch({ load_dot_env() }, error = function(e) { message("No .env file found.") })
@@ -20,8 +22,21 @@ OPENROUTER_API_KEY <- Sys.getenv("OPENROUTER_API_KEY")
 
 # --- 1. CONFIGURATION & CACHING ---
 
-# Initialize global cache environment to store historical data
-stock_cache <- new.env()
+# Disk-backed cache for historical data. Unlike an in-memory environment, it is
+# shared between the main process and the parallel scan workers. Entries expire
+# after CACHE_TTL_SECS so a long-running session doesn't serve stale prices.
+CACHE_TTL_SECS <- 15 * 60
+stock_cache <- cachem::cache_disk(dir = file.path(tempdir(), "scout_cache"),
+                                  max_age = CACHE_TTL_SECS)
+
+# cachem keys may only contain [a-z0-9_-]; tickers like "M&M.NS" don't, so hex-encode.
+cache_key <- function(symbol, days_back) {
+  paste(sprintf("%02x", as.integer(charToRaw(paste0(symbol, "|", days_back)))), collapse = "")
+}
+
+# Calendar days of history needed per timeframe. Analysis requires >= 60 bars:
+# 200 days gives ~138 daily bars; weekly needs ~2 years to get ~100 weekly bars.
+days_back_for <- function(timeframe) if (timeframe == "weekly") 730 else 200
 
 sector_map <- list(
   "BANKING" = c("HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "INDUSINDBK.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "HDFCLIFE.NS"),
@@ -121,10 +136,13 @@ get_ai_best_pick <- function(symbol, score, price) {
 
 # Wrapper to check cache before pinging Yahoo
 get_cached_stock_data <- function(symbol, days_back = 200) {
-  if (exists(symbol, envir = stock_cache)) {
-    return(get(symbol, envir = stock_cache))
+  key <- cache_key(symbol, days_back)
+  cached <- stock_cache$get(key)
+  if (!cachem::is.key_missing(cached) &&
+      difftime(Sys.time(), cached$time, units = "secs") < CACHE_TTL_SECS) {
+    return(cached$data)
   }
-  
+
   tryCatch({
     fetch_sym <- if(symbol == "^NSEI") "NIFTYBEES.NS" else symbol
     raw_data <- getSymbols(fetch_sym, src = "yahoo", auto.assign = FALSE, 
@@ -132,7 +150,7 @@ get_cached_stock_data <- function(symbol, days_back = 200) {
     raw_data <- na.locf(raw_data, na.rm = TRUE)
     
     # Store in cache
-    assign(symbol, raw_data, envir = stock_cache)
+    stock_cache$set(key, list(time = Sys.time(), data = raw_data))
     return(raw_data)
   }, error = function(e) {
     return(NULL)
@@ -142,7 +160,7 @@ get_cached_stock_data <- function(symbol, days_back = 200) {
 get_technical_analysis <- function(symbol, timeframe = "daily", market_score = NULL, top_sector = NULL) {
   
   data <- tryCatch({
-    raw <- get_cached_stock_data(symbol)
+    raw <- get_cached_stock_data(symbol, days_back = days_back_for(timeframe))
     if(is.null(raw)) return(NULL)
     if(timeframe == "weekly") raw <- to.weekly(raw)
     raw
@@ -291,6 +309,34 @@ get_technical_analysis <- function(symbol, timeframe = "daily", market_score = N
   )
 }
 
+# Scan a chunk of symbols (runs inside a parallel worker). Returns a data.frame or NULL.
+scan_symbols <- function(symbols, timeframe, market_score) {
+  rows <- lapply(symbols, function(sym) {
+    if (sym == "NIFTYBEES.NS" || sym == "^NSEI") return(NULL)
+
+    res <- tryCatch({
+      get_technical_analysis(sym, timeframe = timeframe, market_score = market_score)
+    }, error = function(e) return(NULL))
+
+    # Pre-filter block
+    if (!is.null(res) && res$score >= 0 && res$vol_ratio > 0.5 && res$price > 20) {
+      return(data.frame(
+        Symbol = sym,
+        Sector = get_sector_name(sym),
+        Price = res$price,
+        Score = res$score,
+        VolRatio = res$vol_ratio,
+        Verdict = res$verdict,
+        Risk = res$risk
+      ))
+    }
+    NULL
+  })
+  rows <- rows[!vapply(rows, is.null, logical(1))]
+  if (length(rows) == 0) return(NULL)
+  do.call(rbind, rows)
+}
+
 # --- 5. UI ---
 ui <- page_sidebar(
   theme = bs_theme(bootswatch = "litera"), 
@@ -390,7 +436,7 @@ server <- function(input, output, session) {
         
         should_run_ai <- (res$verdict %in% c("▲ STRONG BUY", "▼ TRASH (DUMP)")) || (symbol == "NIFTYBEES.NS")
         
-        future({
+        future_promise({
           if (should_run_ai) {
             get_ai_double_check(res)
           } else {
@@ -398,6 +444,10 @@ server <- function(input, output, session) {
           }
         }) %...>% (function(ai_result) {
           ai_output_val(ai_result)
+          ai_busy(FALSE)
+        }) %...!% (function(error) {
+          # Always release the lock, or every later click reports "AI Busy".
+          ai_output_val(paste("⚠️ AI check failed:", conditionMessage(error)))
           ai_busy(FALSE)
         })
       } else {
@@ -412,8 +462,8 @@ server <- function(input, output, session) {
   
   observeEvent(input$run_analysis, {
     req(input$stock_input)
-    hit_list_data(NULL)
-    sector_data(NULL)
+    # Keep the last scan's sector ranking and hit list: process_stock() reads
+    # sector_data() to apply the leading-sector bonus, and the CSV export needs the hit list.
     process_stock(input$stock_input, input$timeframe)
   })
   
@@ -431,33 +481,15 @@ server <- function(input, output, session) {
     tf_val <- input$timeframe
     universe <- live_scan_list
     
-    future({
-      # Execute over the universe in parallel background threads
-      results <- future_lapply(universe, function(sym) {
-        if (sym == "NIFTYBEES.NS" || sym == "^NSEI") return(NULL)
-        
-        res <- tryCatch({
-          get_technical_analysis(sym, timeframe = tf_val, market_score = curr_mkt_score)
-        }, error = function(e) return(NULL))
-        
-        # Pre-filter block 
-        if (!is.null(res) && res$score >= 0 && res$vol_ratio > 0.5 && res$price > 20) {
-          return(data.frame(
-            Symbol = sym, 
-            Sector = get_sector_name(sym), 
-            Price = res$price, 
-            Score = res$score, 
-            VolRatio = res$vol_ratio, 
-            Verdict = res$verdict, 
-            Risk = res$risk
-          ))
-        }
-        return(NULL)
-      }, future.seed = TRUE)
-      
-      # Bind non-null results
-      do.call(rbind, results[!sapply(results, is.null)])
-      
+    # One chunk per worker, each run as its own future, so the chunks run in
+    # parallel without blocking the Shiny session.
+    chunks <- split(universe, cut(seq_along(universe), min(n_workers, length(universe)), labels = FALSE))
+    chunk_promises <- lapply(chunks, function(syms) {
+      future_promise(scan_symbols(syms, tf_val, curr_mkt_score), seed = TRUE)
+    })
+
+    promise_all(.list = unname(chunk_promises)) %...>% (function(parts) {
+      do.call(rbind, parts[!vapply(parts, is.null, logical(1))])
     }) %...>% (function(valid_buys) {
       
       if (is.null(valid_buys) || nrow(valid_buys) == 0) {
@@ -508,10 +540,12 @@ server <- function(input, output, session) {
         top_stock <- final_list[1,]
         ai_output_val(paste("Finding AI narrative for", top_stock$Symbol, "..."))
         
-        future({
+        future_promise({
           get_ai_best_pick(top_stock$Symbol, top_stock$Score, top_stock$Price)
         }) %...>% (function(ai_res) {
           ai_output_val(paste("🏆 TOP PICK:", top_stock$Symbol, "-", ai_res))
+        }) %...!% (function(error) {
+          ai_output_val(paste("🏆 TOP PICK:", top_stock$Symbol, "- (AI narrative failed)"))
         })
       } else {
         ai_output_val("Scan Complete: Market looks weak.")
