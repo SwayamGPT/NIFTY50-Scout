@@ -1,0 +1,12 @@
+# Secrets
+.env
+.Renviron
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Deployment
+rsconnect/
